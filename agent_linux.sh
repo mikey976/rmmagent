@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 
 if [ $EUID -ne 0 ]; then
@@ -12,13 +13,13 @@ if [ "${HAS_SYSTEMD}" != 'systemd' ]; then
     exit 1
 fi
 
-agentDL='"https://drive.google.com/file/d/1-OmTnMnYo0IW41gjTJQFV-ykcOhLtbmL/view?usp=sharing"'
-meshDL='"https://mesh.mbm-fab.com"'
+agentDL='https://github.com/mikey976/rmmagent/blob/master/rmmagent'
+meshDL='https://mesh.mbm-fab.com/meshagents?id=CjBOc%24%24yV2xqc8LKKjjW9YVir3bJ%40P0Cw4s2JeX%24m5D4oISjYaDXiX3WR7XZgIDt&installflags=0&meshinstall=6'
 
-apiURL='"https://api.mbm-fab.com"'
-token='90e7a5750bebce1571530a2f36f70273e663cc6336463567449b0310b39844f5'
-clientID='"1"'
-siteID='"1"'
+apiURL='https://api.mbm-fab.com'
+token='28192816253ad5f875c8103b4211749443626933ad70ac666c802c29c4618524'
+clientID='1'
+siteID='1'
 agentType='server'
 proxy=''
 
