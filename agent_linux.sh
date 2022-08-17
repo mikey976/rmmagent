@@ -16,7 +16,7 @@ agentDL='https://github.com/mikey976/rmmagent/raw/master/rmmagent'
 meshDL='https://mesh.mbm-fab.com/meshagents?id=CjBOc%24%24yV2xqc8LKKjjW9YVir3bJ%40P0Cw4s2JeX%24m5D4oISjYaDXiX3WR7XZgIDt&installflags=0&meshinstall=6'
 
 apiURL='https://api.mbm-fab.com'
-token='7bb89984eb6d39f3c48efcecefab833dd733dc870b589c21cf56b635993a4a95'
+token='94757943f4da7572e5492d940274895c8bd13291192377787f4cc83024664716'
 clientID='1'
 siteID='1'
 agentType='server'
