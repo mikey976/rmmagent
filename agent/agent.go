@@ -66,6 +66,9 @@ type Agent struct {
 	Platform      string
 	GoArch        string
 	ServiceConfig *service.Config
+	NatsServer    string
+	NatsProxyPath string
+	NatsProxyPort string
 }
 
 const (
@@ -73,8 +76,16 @@ const (
 	winExeName    = "tacticalrmm.exe"
 	winSvcName    = "tacticalrmm"
 	meshSvcName   = "mesh agent"
+	etcConfig     = "/etc/tacticalagent"
+	nixAgentDir   = "/opt/tacticalagent"
+	nixAgentBin   = nixAgentDir + "/tacticalagent"
+	macPlistPath  = "/Library/LaunchDaemons/tacticalagent.plist"
+	macPlistName  = "tacticalagent"
+	macMeshSvcDir = "/usr/local/mesh_services"
 )
 
+var winTempDir = filepath.Join(os.Getenv("PROGRAMDATA"), "TacticalRMM")
+var winMeshDir = filepath.Join(os.Getenv("PROGRAMFILES"), "Mesh Agent")
 var natsCheckin = []string{"agent-hello", "agent-agentinfo", "agent-disks", "agent-winsvc", "agent-publicip", "agent-wmi"}
 
 func New(logger *logrus.Logger, version string) *Agent {
@@ -115,13 +126,18 @@ func New(logger *logrus.Logger, version string) *Agent {
 	}
 
 	var MeshSysExe string
-	if len(ac.CustomMeshDir) > 0 {
-		MeshSysExe = filepath.Join(ac.CustomMeshDir, "MeshAgent.exe")
-	} else {
-		MeshSysExe = filepath.Join(os.Getenv("ProgramFiles"), "Mesh Agent", "MeshAgent.exe")
-	}
-
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "windows":
+		if len(ac.CustomMeshDir) > 0 {
+			MeshSysExe = filepath.Join(ac.CustomMeshDir, "MeshAgent.exe")
+		} else {
+			MeshSysExe = filepath.Join(os.Getenv("ProgramFiles"), "Mesh Agent", "MeshAgent.exe")
+		}
+	case "linux":
+		MeshSysExe = "/opt/tacticalmesh/meshagent"
+	case "darwin":
+		MeshSysExe = "/usr/local/mesh_services/meshagent/meshagent"
+	default:
 		MeshSysExe = "/opt/tacticalmesh/meshagent"
 	}
 
@@ -139,9 +155,25 @@ func New(logger *logrus.Logger, version string) *Agent {
 		},
 	}
 
+	var natsProxyPath, natsProxyPort string
+	if ac.NatsProxyPath == "" {
+		natsProxyPath = "natsws"
+	}
+
+	if ac.NatsProxyPort == "" {
+		natsProxyPort = "443"
+	}
+
+	// check if using nats standard tcp, otherwise use nats websockets by default
+	var natsServer string
+	if ac.NatsStandardPort != "" {
+		natsServer = fmt.Sprintf("tls://%s:%s", ac.APIURL, ac.NatsStandardPort)
+	} else {
+		natsServer = fmt.Sprintf("wss://%s:%s", ac.APIURL, natsProxyPort)
+	}
+
 	return &Agent{
 		Hostname:      info.Hostname,
-		Arch:          info.Architecture,
 		BaseURL:       ac.BaseURL,
 		AgentID:       ac.AgentID,
 		ApiURL:        ac.APIURL,
@@ -164,6 +196,9 @@ func New(logger *logrus.Logger, version string) *Agent {
 		Platform:      runtime.GOOS,
 		GoArch:        runtime.GOARCH,
 		ServiceConfig: svcConf,
+		NatsServer:    natsServer,
+		NatsProxyPath: natsProxyPath,
+		NatsProxyPort: natsProxyPort,
 	}
 }
 
@@ -181,6 +216,7 @@ type CmdOptions struct {
 	IsScript     bool
 	IsExecutable bool
 	Detached     bool
+	Env          []string
 }
 
 func (a *Agent) NewCMDOpts() *CmdOptions {
@@ -204,11 +240,16 @@ func (a *Agent) CmdV2(c *CmdOptions) CmdStatus {
 	// have a child process that is in a different process group so that
 	// parent terminating doesn't kill child
 	if c.Detached {
-		cmdOptions.BeforeExec = []func(cmd *exec.Cmd){
-			func(cmd *exec.Cmd) {
-				cmd.SysProcAttr = SetDetached()
-			},
-		}
+		cmdOptions.BeforeExec = append(cmdOptions.BeforeExec, func(cmd *exec.Cmd) {
+			cmd.SysProcAttr = SetDetached()
+		})
+	}
+
+	if len(c.Env) > 0 {
+		cmdOptions.BeforeExec = append(cmdOptions.BeforeExec, func(cmd *exec.Cmd) {
+			cmd.Env = os.Environ()
+			cmd.Env = append(cmd.Env, c.Env...)
+		})
 	}
 
 	var envCmd *gocmd.Cmd
@@ -360,6 +401,7 @@ func (a *Agent) setupNatsOptions() []nats.Option {
 	opts = append(opts, nats.RetryOnFailedConnect(true))
 	opts = append(opts, nats.MaxReconnects(-1))
 	opts = append(opts, nats.ReconnectBufSize(-1))
+	opts = append(opts, nats.ProxyPath(a.NatsProxyPath))
 	return opts
 }
 
@@ -379,46 +421,47 @@ func (a *Agent) GetUninstallExe() string {
 }
 
 func (a *Agent) CleanupAgentUpdates() {
-	cderr := os.Chdir(a.ProgramDir)
-	if cderr != nil {
-		a.Logger.Errorln(cderr)
-		return
-	}
+	// TODO remove a.ProgramDir, updates are now in winTempDir
+	dirs := [2]string{winTempDir, a.ProgramDir}
+	for _, dir := range dirs {
+		err := os.Chdir(dir)
+		if err != nil {
+			a.Logger.Debugln("CleanupAgentUpdates()", dir, err)
+			continue
+		}
 
-	files, err := filepath.Glob("winagent-v*.exe")
-	if err == nil {
-		for _, f := range files {
-			os.Remove(f)
+		// TODO winagent-v* is deprecated
+		globs := [2]string{"tacticalagent-v*", "winagent-v*"}
+		for _, glob := range globs {
+			files, err := filepath.Glob(glob)
+			if err == nil {
+				for _, f := range files {
+					a.Logger.Debugln("CleanupAgentUpdates() Removing file:", f)
+					os.Remove(f)
+				}
+			}
 		}
 	}
 
-	cderr = os.Chdir(os.Getenv("TMP"))
-	if cderr != nil {
-		a.Logger.Errorln(cderr)
-		return
-	}
-	folders, err := filepath.Glob("tacticalrmm*")
+	err := os.Chdir(os.Getenv("TMP"))
 	if err == nil {
-		for _, f := range folders {
-			os.RemoveAll(f)
+		dirs, err := filepath.Glob("tacticalrmm*")
+		if err == nil {
+			for _, f := range dirs {
+				os.RemoveAll(f)
+			}
 		}
 	}
 }
 
 func (a *Agent) RunPythonCode(code string, timeout int, args []string) (string, error) {
 	content := []byte(code)
-	dir, err := ioutil.TempDir("", "tacticalpy")
-	if err != nil {
-		a.Logger.Debugln(err)
-		return "", err
-	}
-	defer os.RemoveAll(dir)
-
-	tmpfn, _ := ioutil.TempFile(dir, "*.py")
+	tmpfn, _ := ioutil.TempFile(winTempDir, "*.py")
 	if _, err := tmpfn.Write(content); err != nil {
 		a.Logger.Debugln(err)
 		return "", err
 	}
+	defer os.Remove(tmpfn.Name())
 	if err := tmpfn.Close(); err != nil {
 		a.Logger.Debugln(err)
 		return "", err
@@ -458,13 +501,12 @@ func (a *Agent) RunPythonCode(code string, timeout int, args []string) (string, 
 
 }
 
-func (a *Agent) CreateTRMMTempDir() {
-	// create the temp dir for running scripts
-	dir := filepath.Join(os.TempDir(), "trmm")
-	if !trmm.FileExists(dir) {
-		err := os.Mkdir(dir, 0775)
+func createWinTempDir() error {
+	if !trmm.FileExists(winTempDir) {
+		err := os.Mkdir(winTempDir, 0775)
 		if err != nil {
-			a.Logger.Errorln(err)
+			return err
 		}
 	}
+	return nil
 }

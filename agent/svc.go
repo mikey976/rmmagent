@@ -12,7 +12,7 @@ https://license.tacticalrmm.com
 package agent
 
 import (
-	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -28,9 +28,14 @@ func (a *Agent) RunAsService() {
 }
 
 func (a *Agent) AgentSvc() {
-	go a.GetPython(false)
+	if runtime.GOOS == "windows" {
+		go a.GetPython(false)
 
-	a.CreateTRMMTempDir()
+		err := createWinTempDir()
+		if err != nil {
+			a.Logger.Errorln("AgentSvc() createWinTempDir():", err)
+		}
+	}
 	a.RunMigrations()
 
 	sleepDelay := randRange(14, 22)
@@ -38,8 +43,7 @@ func (a *Agent) AgentSvc() {
 	time.Sleep(time.Duration(sleepDelay) * time.Second)
 
 	opts := a.setupNatsOptions()
-	server := fmt.Sprintf("tls://%s:4222", a.ApiURL)
-	nc, err := nats.Connect(server, opts...)
+	nc, err := nats.Connect(a.NatsServer, opts...)
 	if err != nil {
 		a.Logger.Fatalln("AgentSvc() nats.Connect()", err)
 	}
@@ -52,8 +56,10 @@ func (a *Agent) AgentSvc() {
 	go a.SyncMeshNodeID()
 
 	time.Sleep(time.Duration(randRange(1, 3)) * time.Second)
-	a.AgentStartup()
-	a.SendSoftware()
+	if runtime.GOOS == "windows" {
+		a.AgentStartup()
+		a.SendSoftware()
+	}
 
 	checkInHelloTicker := time.NewTicker(time.Duration(randRange(30, 60)) * time.Second)
 	checkInAgentInfoTicker := time.NewTicker(time.Duration(randRange(200, 400)) * time.Second)

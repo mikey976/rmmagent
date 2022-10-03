@@ -1,3 +1,6 @@
+//go:build !windows
+// +build !windows
+
 /*
 Copyright 2022 AmidaWare LLC.
 
@@ -15,6 +18,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -46,7 +50,7 @@ func (a *Agent) GetDisks() []trmm.Disk {
 	}
 
 	for _, p := range partitions {
-		if strings.Contains(p.Device, "dev/loop") {
+		if strings.Contains(p.Device, "dev/loop") || strings.Contains(p.Device, "devfs") {
 			continue
 		}
 		usage, err := disk.Usage(p.Mountpoint)
@@ -70,10 +74,33 @@ func (a *Agent) GetDisks() []trmm.Disk {
 }
 
 func (a *Agent) SystemRebootRequired() (bool, error) {
-	paths := [2]string{"/var/run/reboot-required", "/usr/bin/needs-restarting"}
+	// deb
+	paths := [2]string{"/var/run/reboot-required", "/run/reboot-required"}
 	for _, p := range paths {
 		if trmm.FileExists(p) {
 			return true, nil
+		}
+	}
+	// rhel
+	bins := [2]string{"/usr/bin/needs-restarting", "/bin/needs-restarting"}
+	for _, bin := range bins {
+		if trmm.FileExists(bin) {
+			opts := a.NewCMDOpts()
+			// https://man7.org/linux/man-pages/man1/needs-restarting.1.html
+			// -r Only report whether a full reboot is required (exit code 1) or not (exit code 0).
+			opts.Command = fmt.Sprintf("%s -r", bin)
+			out := a.CmdV2(opts)
+
+			if out.Status.Error != nil {
+				a.Logger.Debugln("SystemRebootRequired(): ", out.Status.Error.Error())
+				continue
+			}
+
+			if out.Status.Exit == 1 {
+				return true, nil
+			}
+
+			return false, nil
 		}
 	}
 	return false, nil
@@ -119,20 +146,23 @@ func NewAgentConfig() *rmm.AgentConfig {
 	pk, _ := strconv.Atoi(agentpk)
 
 	ret := &rmm.AgentConfig{
-		BaseURL:       viper.GetString("baseurl"),
-		AgentID:       viper.GetString("agentid"),
-		APIURL:        viper.GetString("apiurl"),
-		Token:         viper.GetString("token"),
-		AgentPK:       agentpk,
-		PK:            pk,
-		Cert:          viper.GetString("cert"),
-		Proxy:         viper.GetString("proxy"),
-		CustomMeshDir: viper.GetString("meshdir"),
+		BaseURL:          viper.GetString("baseurl"),
+		AgentID:          viper.GetString("agentid"),
+		APIURL:           viper.GetString("apiurl"),
+		Token:            viper.GetString("token"),
+		AgentPK:          agentpk,
+		PK:               pk,
+		Cert:             viper.GetString("cert"),
+		Proxy:            viper.GetString("proxy"),
+		CustomMeshDir:    viper.GetString("meshdir"),
+		NatsProxyPath:    viper.GetString("natsproxypath"),
+		NatsProxyPort:    viper.GetString("natsproxyport"),
+		NatsStandardPort: viper.GetString("natsstandardport"),
 	}
 	return ret
 }
 
-func (a *Agent) RunScript(code string, shell string, args []string, timeout int) (stdout, stderr string, exitcode int, e error) {
+func (a *Agent) RunScript(code string, shell string, args []string, timeout int, runasuser bool) (stdout, stderr string, exitcode int, e error) {
 	code = removeWinNewLines(code)
 	content := []byte(code)
 
@@ -179,6 +209,13 @@ func SetDetached() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setpgid: true}
 }
 
+func (a *Agent) seEnforcing() bool {
+	opts := a.NewCMDOpts()
+	opts.Command = "getenforce"
+	out := a.CmdV2(opts)
+	return out.Status.Exit == 0 && strings.Contains(out.Stdout, "Enforcing")
+}
+
 func (a *Agent) AgentUpdate(url, inno, version string) {
 
 	self, err := os.Executable()
@@ -195,7 +232,7 @@ func (a *Agent) AgentUpdate(url, inno, version string) {
 	defer os.Remove(f.Name())
 
 	a.Logger.Infof("Agent updating from %s to %s", a.Version, version)
-	a.Logger.Infoln("Downloading agent update from", url)
+	a.Logger.Debugln("Downloading agent update from", url)
 
 	rClient := resty.New()
 	rClient.SetCloseConnection(true)
@@ -221,13 +258,49 @@ func (a *Agent) AgentUpdate(url, inno, version string) {
 	os.Chmod(f.Name(), 0755)
 	err = os.Rename(f.Name(), self)
 	if err != nil {
-		a.Logger.Errorln("AgentUpdate() os.Rename():", err)
-		return
+		a.Logger.Debugln("Detected /tmp on different filesystem")
+		// rename does not work when src and dest are on different filesystems
+		// so we need to manually copy it to the same fs then rename it
+		cwd, err := os.Getwd()
+		if err != nil {
+			a.Logger.Errorln("AgentUpdate() os.Getwd():", err)
+			return
+		}
+		// create a tmpfile in same fs as agent
+		tmpfile := filepath.Join(cwd, GenerateAgentID())
+		defer os.Remove(tmpfile)
+		a.Logger.Debugln("Copying tmpfile from", f.Name(), "to", tmpfile)
+		cperr := copyFile(f.Name(), tmpfile)
+		if cperr != nil {
+			a.Logger.Errorln("AgentUpdate() copyFile:", cperr)
+			return
+		}
+		os.Chmod(tmpfile, 0755)
+		rerr := os.Rename(tmpfile, self)
+		if rerr != nil {
+			a.Logger.Errorln("AgentUpdate() os.Rename():", rerr)
+			return
+		}
+	}
+
+	if runtime.GOOS == "linux" && a.seEnforcing() {
+		se := a.NewCMDOpts()
+		se.Command = fmt.Sprintf("restorecon -rv %s", self)
+		out := a.CmdV2(se)
+		a.Logger.Debugln("%+v\n", out)
 	}
 
 	opts := a.NewCMDOpts()
 	opts.Detached = true
-	opts.Command = "systemctl restart tacticalagent.service"
+	switch runtime.GOOS {
+	case "linux":
+		opts.Command = "systemctl restart tacticalagent.service"
+	case "darwin":
+		opts.Command = "launchctl kickstart -k system/tacticalagent"
+	default:
+		return
+	}
+
 	a.CmdV2(opts)
 }
 
@@ -245,7 +318,9 @@ func (a *Agent) AgentUninstall(code string) {
 	opts := a.NewCMDOpts()
 	opts.IsScript = true
 	opts.Shell = f.Name()
-	opts.Args = []string{"uninstall"}
+	if runtime.GOOS == "linux" {
+		opts.Args = []string{"uninstall"}
+	}
 	opts.Detached = true
 	a.CmdV2(opts)
 }
@@ -289,7 +364,15 @@ func (a *Agent) getMeshNodeID() (string, error) {
 func (a *Agent) RecoverMesh() {
 	a.Logger.Infoln("Attempting mesh recovery")
 	opts := a.NewCMDOpts()
-	opts.Command = "systemctl restart meshagent.service"
+	def := "systemctl restart meshagent.service"
+	switch runtime.GOOS {
+	case "linux":
+		opts.Command = def
+	case "darwin":
+		opts.Command = "launchctl kickstart -k system/meshagent"
+	default:
+		opts.Command = def
+	}
 	a.CmdV2(opts)
 	a.SyncMeshNodeID()
 }
@@ -348,18 +431,25 @@ func (a *Agent) GetWMIInfo() map[string]interface{} {
 	wmiInfo["make_model"] = ""
 	chassis, err := ghw.Chassis(ghw.WithDisableWarnings())
 	if err != nil {
-		a.Logger.Errorln("ghw.Chassis()", err)
+		a.Logger.Debugln("ghw.Chassis()", err)
 	} else {
 		if chassis.Vendor != "" || chassis.Version != "" {
 			wmiInfo["make_model"] = fmt.Sprintf("%s %s", chassis.Vendor, chassis.Version)
 		}
 	}
 
+	if runtime.GOOS == "darwin" {
+		opts := a.NewCMDOpts()
+		opts.Command = "sysctl hw.model"
+		out := a.CmdV2(opts)
+		wmiInfo["make_model"] = strings.ReplaceAll(out.Stdout, "hw.model: ", "")
+	}
+
 	// gfx cards
 
 	gpu, err := ghw.GPU(ghw.WithDisableWarnings())
 	if err != nil {
-		a.Logger.Errorln("ghw.GPU()", err)
+		a.Logger.Debugln("ghw.GPU()", err)
 	} else {
 		for _, i := range gpu.GraphicsCards {
 			if i.DeviceInfo != nil {
@@ -456,7 +546,7 @@ func (a *Agent) installMesh(meshbin, exe, proxy string) (string, error) {
 	return "not implemented", nil
 }
 
-func CMDShell(shell string, cmdArgs []string, command string, timeout int, detached bool) (output [2]string, e error) {
+func CMDShell(shell string, cmdArgs []string, command string, timeout int, detached bool, runasuser bool) (output [2]string, e error) {
 	return [2]string{"", ""}, nil
 }
 
