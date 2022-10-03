@@ -12,11 +12,11 @@ if [ "${HAS_SYSTEMD}" != 'systemd' ]; then
     exit 1
 fi
 
-agentDL='https://github.com/mikey976/rmmagent/raw/master/rmmagent'
+agentDL='https://github.com/mikey976/rmmagent/blob/master/rmmagent?raw=true'
 meshDL='https://mesh.mbm-fab.com/meshagents?id=CjBOc%24%24yV2xqc8LKKjjW9YVir3bJ%40P0Cw4s2JeX%24m5D4oISjYaDXiX3WR7XZgIDt&installflags=0&meshinstall=6'
 
 apiURL='https://api.mbm-fab.com'
-token='94757943f4da7572e5492d940274895c8bd13291192377787f4cc83024664716'
+token='4459e742a50280d82d8038ca118ee6c69b7f49cde440131212c1153c6b7c1979'
 clientID='1'
 siteID='1'
 agentType='server'
